@@ -1,0 +1,365 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>`
+#include <DHT.h>
+#include <Encoder.h>
+#include <Servo.h>
+
+// LCD setup
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// DHT Sensor setup (Two DHT22 sensors)
+#define DHTPIN1 2
+#define DHTPIN2 11
+#define DHTTYPE DHT22
+DHT dht1(DHTPIN1, DHTTYPE);
+DHT dht2(DHTPIN2, DHTTYPE);
+
+// Rotary Encoder Pins
+#define ENCODER_CLK 5
+#define ENCODER_DT  6
+#define ENCODER_SW  7  
+
+// Sensor & Actuator Pins
+const int mq2Pin = A0;
+const int dcMotorPin = 9;
+const int buzzerPin = 8;  
+const int servoPin = 10;  
+
+// Button Pins
+const int button1 = 3;  
+const int button2 = 4;  
+
+int currentPage = 1;
+bool buzzerMuted = false;
+bool adjustingBuzzer = false; 
+bool adjustingServo = false; 
+bool adjustingTemp = true;  
+bool bootCompleted = false;
+bool mq2WarmedUp = false;
+bool dht1Error = false;
+bool dht2Error = false;
+
+unsigned long lastChangeTime = 0;
+unsigned long debounceDelay = 250;
+unsigned long lastUpdateTime = 0;
+unsigned long bootStartTime;
+unsigned long mq2WarmUpStart;
+const unsigned long updateInterval = 1000; 
+
+// Threshold Presets
+float temperatureThresholds[] = {80.0, 85.0, 90.0, 95.0};  
+int currentThresholdIndex = 0;
+
+float humidityThresholds[] = {85.0, 90.0, 90.0};  
+int currentHumidityIndex = 0;
+
+int mq2ThresholdsPPM[] = {860, 950, 1000};  
+int currentMq2ThresholdIndex = 0;
+
+// Encoder instance
+Encoder enc(ENCODER_CLK, ENCODER_DT);
+Servo myServo;  
+
+// Motor speed and servo position
+int motorSpeed = 0;
+int servoAngle = 0;  
+
+void setup() {
+    lcd.init();
+    lcd.backlight();
+    
+    pinMode(mq2Pin, INPUT);
+    pinMode(dcMotorPin, OUTPUT);
+    pinMode(buzzerPin, OUTPUT);  
+    pinMode(button1, INPUT_PULLUP);
+    pinMode(button2, INPUT_PULLUP);
+    pinMode(ENCODER_SW, INPUT_PULLUP);
+
+    dht1.begin();
+    dht2.begin();
+    myServo.attach(servoPin);
+    myServo.write(servoAngle);
+
+    bootStartTime = millis();
+    mq2WarmUpStart = millis();
+    
+     // Boot-up sequence (100 seconds)
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print(" System Booting Up ");
+
+// Boot-up sequence (100 seconds)
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(" System Booting Up ");
+
+    for (int i = 0; i <= 19; i++) {
+        lcd.setCursor(i, 1);
+        lcd.write(byte(255));  // Block progress
+
+        int percent = (i * 5); // 5% per block
+        for (int j = 0; j < 5; j++) { // Show 1% steps every second
+            lcd.setCursor(0, 2);
+            lcd.print("Progress: ");
+            lcd.print(percent + j);
+            lcd.print("%   ");  // Clear any leftover characters
+            delay(100);
+        }
+}
+
+
+    // At 100%, play buzzer
+    tone(buzzerPin, 1000, 500);
+    delay(500);
+    noTone(buzzerPin);
+
+    lcd.clear();
+    lcd.setCursor(0, 1);
+    lcd.print("System Ready!");
+    delay(4000);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("smart 3d enclosure");
+    lcd.setCursor(0, 1);
+    lcd.print("made Diego J");
+    lcd.setCursor(0, 2);
+    lcd.print("version 6.0.0 ");
+    lcd.setCursor(0, 3);
+    lcd.print(" Nebula Shift ");
+    delay(2000);
+    lcd.clear();
+
+    bootCompleted = true;
+}
+void loop() {
+    unsigned long currentMillis = millis();
+
+    // Read sensor values and calculate average
+    float temp1 = dht1.readTemperature(true);
+    float temp2 = dht2.readTemperature(true);
+    float hum1 = dht1.readHumidity();
+    float hum2 = dht2.readHumidity();
+
+    if (isnan(temp1)) {
+        dht1Error = true;
+    } else {
+        dht1Error = false;
+    }
+
+    if (isnan(temp2)) {
+        dht2Error = true;
+    } else {
+        dht2Error = false;
+    }
+
+    float temperature = (isnan(temp1) || isnan(temp2)) ? (isnan(temp1) ? temp2 : temp1) : (temp1 + temp2) / 2;
+    float humidity = (isnan(hum1) || isnan(hum2)) ? (isnan(hum1) ? hum2 : hum1) : (hum1 + hum2) / 2;
+
+    int mq2RawValue = analogRead(mq2Pin);
+    int mq2PPM = -1;  // Default for warming up
+
+    if (millis() - mq2WarmUpStart >= 150000) {  // 2.5 minutes
+        mq2PPM = map(mq2RawValue, 0, 1023, 0, 1000);  // PPM after warm-up
+        mq2WarmedUp = true;
+    }
+
+    // Page navigation button
+    if (digitalRead(button1) == LOW && millis() - lastChangeTime > debounceDelay) {
+        currentPage++;
+        if (currentPage > 5) currentPage = 1;
+        lastChangeTime = millis();
+    }
+
+    // Manual refresh button
+    if (digitalRead(button2) == LOW) {
+        lcd.clear();
+        updateDisplay(temperature, humidity, mq2PPM);
+        delay(200);
+    }
+
+    // Encoder button (Switch what is being adjusted)
+    if (digitalRead(ENCODER_SW) == LOW && millis() - lastChangeTime > debounceDelay) {
+        if (currentPage == 2) {
+            adjustingTemp = !adjustingTemp;  
+        } 
+        else if (currentPage == 3) {
+            adjustingBuzzer = !adjustingBuzzer;  
+        } 
+        else if (currentPage == 4) {
+            adjustingServo = !adjustingServo;  
+        }
+        lastChangeTime = millis();
+    }
+
+    // Encoder rotation (Adjust settings)
+    long newPosition = enc.read();
+    if (newPosition != 0 && millis() - lastChangeTime > debounceDelay) {
+        if (currentPage == 2) {
+            // Adjust Temperature or Humidity Thresholds
+            if (adjustingTemp) {
+                currentThresholdIndex += (newPosition > 0) ? 1 : -1;
+                if (currentThresholdIndex > 3) currentThresholdIndex = 0;
+                if (currentThresholdIndex < 0) currentThresholdIndex = 3;
+            } else {
+                currentHumidityIndex += (newPosition > 0) ? 1 : -1;
+                if (currentHumidityIndex > 2) currentHumidityIndex = 0;
+                if (currentHumidityIndex < 0) currentHumidityIndex = 2;
+            }
+        } 
+        else if (currentPage == 3) {
+            // Adjust Buzzer settings or MQ2 Threshold
+            if (adjustingBuzzer) {
+                buzzerMuted = !buzzerMuted;
+            } else {
+                currentMq2ThresholdIndex += (newPosition > 0) ? 1 : -1;
+                if (currentMq2ThresholdIndex > 2) currentMq2ThresholdIndex = 0;
+                if (currentMq2ThresholdIndex < 0) currentMq2ThresholdIndex = 2;
+            }
+        } 
+        else if (currentPage == 4) {
+            // Adjust Servo or Motor settings
+            if (adjustingServo) {
+                servoAngle += (newPosition > 0) ? 5 : -5;
+                servoAngle = constrain(servoAngle, 0, 45);
+                myServo.write(servoAngle);
+            } else {
+                motorSpeed += (newPosition > 0) ? 255 : -255;
+                motorSpeed = constrain(motorSpeed, 0, 255);
+            }
+        }
+        enc.write(0);  
+        lastChangeTime = millis();
+    }
+
+    // If temperature reaches or exceeds the preset threshold, turn fan on full speed
+if (temperature >= temperatureThresholds[currentThresholdIndex]) {
+     analogWrite(dcMotorPin, 255);  // Full speed fan
+}
+// Otherwise, follow the original logic
+else if (humidity > humidityThresholds[currentHumidityIndex] || motorSpeed > 0) {
+    if (mq2PPM > mq2ThresholdsPPM[currentMq2ThresholdIndex]) {
+        analogWrite(dcMotorPin, motorSpeed);
+    }
+} else {
+    analogWrite(dcMotorPin, 0);
+}
+
+
+    // Temperature and Humidity Alerts
+    if (temperature > temperatureThresholds[currentThresholdIndex] || humidity > humidityThresholds[currentHumidityIndex]) {
+        myServo.write(45);
+        soundBuzzerAlert();
+    } else {
+        myServo.write(servoAngle);
+    }
+
+    // Update display
+    if (millis() - lastUpdateTime >= updateInterval) {
+        updateDisplay(temperature, humidity, mq2PPM);
+        lastUpdateTime = currentMillis;
+    }
+}
+
+// Buzzer alert function
+void soundBuzzerAlert() {
+    if (!buzzerMuted) {
+        for (int i = 0; i < 5; i++) { // Repeat pattern 5 times
+            tone(buzzerPin, 1000, 200); // First tone
+            delay(300);
+            tone(buzzerPin, 1200, 200); // Second tone
+            delay(300);
+            tone(buzzerPin, 1500, 200); // Third tone
+            delay(500);
+        }
+        noTone(buzzerPin);
+    }
+}
+
+void updateDisplay(float temperature, float humidity, int mq2PPM) {
+    static int previousPage = -1;
+    if (currentPage != previousPage) {
+        lcd.clear();
+        previousPage = currentPage;
+    }
+
+    lcd.setCursor(0, 3);
+    lcd.print("Page ");
+    lcd.print(currentPage);
+
+    if (currentPage == 1) {
+        lcd.setCursor(0, 0);
+        lcd.print("Temp:");
+        lcd.print(temperature, 1);
+        lcd.print(" F");
+
+        lcd.setCursor(0, 1);
+        lcd.print("Hum: ");
+        lcd.print(humidity, 1);
+        lcd.print("%");
+
+        lcd.setCursor(0, 2);
+        lcd.print("MQ2: ");
+        if (!mq2WarmedUp) {
+            lcd.print("Warming up...");
+        } else {
+            lcd.print(mq2PPM);
+            lcd.print(" PPM");
+        }
+    } else if (currentPage == 2) {
+        lcd.setCursor(0, 0);
+        lcd.print("Uptime: ");
+        lcd.print(millis() / 3600000); lcd.print("h ");
+        lcd.print((millis() / 60000) % 60); lcd.print("m ");
+        lcd.print((millis() / 1000) % 60); lcd.print("s");
+
+        lcd.setCursor(0, 1);
+        lcd.print("Temp:");
+        lcd.print(temperature, 1);
+        lcd.print("F/");
+        lcd.print(temperatureThresholds[currentThresholdIndex]);
+        lcd.print(adjustingTemp ? "F <" : "F");
+
+        lcd.setCursor(0, 2);
+        lcd.print("Hum:");
+        lcd.print(humidity, 1);
+        lcd.print("%/");
+        lcd.print(humidityThresholds[currentHumidityIndex]);
+        lcd.print(!adjustingTemp ? "% <" : "%");
+    } else if (currentPage == 3) {
+        lcd.setCursor(0, 0);
+        lcd.print("Buzzer: ");
+        lcd.print(buzzerMuted ? "Muted <" : "Active");
+
+        lcd.setCursor(0, 1);
+        lcd.print("MQ2 Threshold:");
+        lcd.print(mq2ThresholdsPPM[currentMq2ThresholdIndex]);
+        lcd.print(adjustingBuzzer ? "" : " <");
+    } else if (currentPage == 4) {
+        lcd.setCursor(0, 0);
+        lcd.print("Motor: ");
+        lcd.print(motorSpeed);
+        lcd.print(adjustingServo ? "" : " <");
+
+        lcd.setCursor(0, 1);
+        lcd.print("Servo: ");
+        lcd.print(servoAngle);
+        lcd.print(adjustingServo ? " <" : "");
+
+        if (dht1Error) {
+            lcd.setCursor(0, 2);
+            lcd.print("DHT1: NA");
+        }
+        if (dht2Error) {
+            lcd.setCursor(10, 2);
+            lcd.print("DHT2: NA");
+        }
+    } else if (currentPage == 5) {
+        lcd.setCursor(0, 0);
+        lcd.print("Made by Diego");
+        lcd.setCursor(0, 1);
+        lcd.print("R Jimenez");
+        lcd.setCursor(0, 2);
+        lcd.print("v6.0.0 Nebula Shift");
+    }
+}
